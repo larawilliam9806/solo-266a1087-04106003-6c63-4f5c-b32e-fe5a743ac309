@@ -29,6 +29,13 @@ class TaskState(StrEnum):
     FAILED = "failed"
 
 
+class QcState(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 class StartTaskRequest(BaseModel):
     station: str = Field(..., examples=["54511"])
     date: str = Field(..., examples=["2026-11-17"])
@@ -73,6 +80,16 @@ class CatalogEntry(BaseModel):
         return value
 
 
+class QcSummary(BaseModel):
+    """The QC report applicable to the task's current package, if one exists."""
+
+    report_id: str
+    state: QcState
+    result: str | None = None
+    package_sha256: str
+    finished_at: str | None = None
+
+
 class TaskView(BaseModel):
     id: str
     station: str
@@ -96,6 +113,38 @@ class TaskView(BaseModel):
     updated_at: str
     completed_at: str | None = None
     download_url: str | None = None
+    qc: QcSummary | None = None
+
+
+class QcError(BaseModel):
+    """One QC finding; ``line`` is the 1-based line number in observations.csv."""
+
+    line: int | None = None
+    kind: str
+    message: str
+
+
+class QcReportView(BaseModel):
+    id: str
+    task_id: str
+    station: str
+    date: str
+    state: QcState
+    package_sha256: str
+    package_size: int
+    result: str | None = None
+    row_count: int | None = None
+    valid_rows: int | None = None
+    error_count: int | None = None
+    errors: list[QcError] | None = None
+    errors_truncated: bool | None = None
+    missing_times: list[str] | None = None
+    error: str | None = None
+    attempts: int = 0
+    applies_to_current_package: bool = False
+    created_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
 
 
 class ErrorResponse(BaseModel):

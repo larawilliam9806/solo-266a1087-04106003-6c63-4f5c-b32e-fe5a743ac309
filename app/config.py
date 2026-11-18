@@ -36,3 +36,12 @@ class Settings:
     @property
     def database_path(self) -> Path:
         return self.data_dir / "collector.sqlite3"
+
+    @property
+    def qc_dir(self) -> Path:
+        return self.data_dir / "qc"
+
+    @property
+    def qc_snapshots_dir(self) -> Path:
+        """Immutable copies of packages accepted for quality control."""
+        return self.qc_dir / "snapshots"

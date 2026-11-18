@@ -7,6 +7,7 @@ an admin API that lets a demo switch the current revision or add response delay.
 from __future__ import annotations
 
 import asyncio
+import base64
 import gzip
 import hashlib
 import io
@@ -36,6 +37,7 @@ class SourceState:
     failing: set[tuple[str, str]] = field(default_factory=set)
     corrupting: set[tuple[str, str]] = field(default_factory=set)
     no_range: set[tuple[str, str]] = field(default_factory=set)
+    custom_packages: dict[tuple[str, str], bytes] = field(default_factory=dict)
     requests: list[dict] = field(default_factory=list)
 
     def record(self, method: str, path: str, headers: dict[str, str]) -> None:
@@ -109,6 +111,30 @@ class FaultRequest(BaseModel):
         return value
 
 
+class PackageOverrideRequest(BaseModel):
+    """Serve caller-supplied tar.gz bytes for a station/date (QC fault demos)."""
+
+    station: str
+    date: str
+    content_base64: str | None = Field(
+        default=None, description="base64-encoded package bytes; null clears the override"
+    )
+
+    @field_validator("station")
+    @classmethod
+    def valid_station(cls, value: str) -> str:
+        if not STATION_RE.fullmatch(value):
+            raise ValueError("station must match [A-Za-z0-9_-]{1,32}")
+        return value
+
+    @field_validator("date")
+    @classmethod
+    def valid_date(cls, value: str) -> str:
+        if not DATE_RE.fullmatch(value):
+            raise ValueError("date must be YYYY-MM-DD")
+        return value
+
+
 def _validate(station: str, date: str) -> None:
     if not STATION_RE.fullmatch(station):
         raise HTTPException(400, "invalid station")
@@ -120,8 +146,10 @@ def _validate(station: str, date: str) -> None:
 def build_package(station: str, date: str, revision: str) -> bytes:
     """Build a deterministic tar.gz for (station, date, revision).
 
-    The payload is mostly incompressible so progress and Range behaviour are
-    observable, and switching revisions changes both bytes and digest.
+    The CSV holds exactly one row per quarter-hour slot (96 rows, the daily
+    expectation the collector's QC checks).  The payload is mostly
+    incompressible so progress and Range behaviour are observable, and
+    switching revisions changes both bytes and digest.
     """
     seed = hashlib.sha256(f"{station}|{date}|{revision}".encode()).digest()
     rng = random.Random(seed)
@@ -131,7 +159,7 @@ def build_package(station: str, date: str, revision: str) -> bytes:
         *[
             f"{station},{date},{(i // 4) % 24:02d}:{(i * 15) % 60:02d},"
             f"{rng.uniform(-35, 45):.2f},{rng.uniform(850, 1080):.2f},{rng.uniform(0, 30):.2f}"
-            for i in range(240)
+            for i in range(96)
         ],
     ]
     csv_bytes = ("\n".join(rows) + "\n").encode()
@@ -154,9 +182,17 @@ def build_package(station: str, date: str, revision: str) -> bytes:
     return gzip.compress(tar_buffer.getvalue(), mtime=0)
 
 
+def _body_for(station: str, date: str) -> bytes:
+    """The bytes currently served for a station/date (override wins)."""
+    override = state.custom_packages.get((station, date))
+    if override is not None:
+        return override
+    return build_package(station, date, state.revision(station, date))
+
+
 def _meta(station: str, date: str) -> dict:
     revision = state.revision(station, date)
-    body = build_package(station, date, revision)
+    body = _body_for(station, date)
     digest = hashlib.sha256(body).hexdigest()
     return {
         "name": f"{station}-{date}.tar.gz",
@@ -233,7 +269,7 @@ async def package(
     if (station, date) in state.failing:
         raise HTTPException(503, "simulated source outage")
     entry = _meta(station, date)
-    body = build_package(station, date, entry["revision"])
+    body = _body_for(station, date)
     etag = entry["etag"]
     if (station, date) in state.corrupting:
         # Advertise the honest digest but serve a body with a flipped byte.
@@ -305,6 +341,7 @@ async def admin_state() -> dict:
         "failing": sorted(f"{s}/{d}" for s, d in state.failing),
         "corrupting": sorted(f"{s}/{d}" for s, d in state.corrupting),
         "no_range": sorted(f"{s}/{d}" for s, d in state.no_range),
+        "custom_packages": sorted(f"{s}/{d}" for s, d in state.custom_packages),
         "delay_seconds": state.delay_seconds,
         "chunk_delay_seconds": state.chunk_delay_seconds,
         "recent_requests": state.requests[-50:],
@@ -339,6 +376,28 @@ async def set_delay(body: DelayRequest) -> dict:
     return {"delay_seconds": state.delay_seconds, "chunk_delay_seconds": state.chunk_delay_seconds}
 
 
+@app.post("/admin/package")
+async def set_package_override(body: PackageOverrideRequest) -> dict:
+    key = (body.station, body.date)
+    if body.content_base64 is None:
+        state.custom_packages.pop(key, None)
+        return {"station": body.station, "date": body.date, "override": False}
+    try:
+        raw = base64.b64decode(body.content_base64, validate=True)
+    except ValueError as exc:
+        raise HTTPException(400, f"invalid base64 content: {exc}") from exc
+    if not raw:
+        raise HTTPException(400, "package content must not be empty")
+    state.custom_packages[key] = raw
+    return {
+        "station": body.station,
+        "date": body.date,
+        "override": True,
+        "size": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
 @app.post("/admin/reset")
 async def reset() -> dict:
     state.revisions.clear()
@@ -347,5 +406,6 @@ async def reset() -> dict:
     state.failing.clear()
     state.corrupting.clear()
     state.no_range.clear()
+    state.custom_packages.clear()
     state.requests.clear()
     return {"ok": True}

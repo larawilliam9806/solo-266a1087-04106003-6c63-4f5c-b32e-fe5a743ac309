@@ -5,7 +5,8 @@ Usage:
     python scripts/demo.py [--source http://localhost:9000] [--api http://localhost:8000]
 
 The demo collects one archive, pauses/resumes it, switches the source revision,
-refreshes and verifies the downloadable package's size and SHA-256.
+refreshes and verifies the downloadable package's size and SHA-256, and runs a
+background quality-control pass over each collected package.
 """
 
 from __future__ import annotations
@@ -26,6 +27,29 @@ def wait(client: httpx.Client, api: str, task_id: str, states: set[str], timeout
             return view
         time.sleep(0.2)
     raise SystemExit(f"timeout waiting for {states}; last={view}")
+
+
+def wait_qc(client: httpx.Client, api: str, report_id: str, timeout: float = 60) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        report = client.get(f"{api}/qc/{report_id}").json()
+        if report["state"] in {"completed", "failed"}:
+            return report
+        time.sleep(0.2)
+    raise SystemExit(f"timeout waiting for qc report {report_id}; last={report}")
+
+
+def run_qc(client: httpx.Client, api: str, task_id: str) -> dict:
+    accepted = client.post(f"{api}/tasks/{task_id}/qc")
+    accepted.raise_for_status()
+    report_id = accepted.json()["id"]
+    report = wait_qc(client, api, report_id)
+    print(
+        f"qc {report_id[:8]}: {report['result']} "
+        f"(rows={report['row_count']} errors={report['error_count']} "
+        f"missing={len(report['missing_times'] or [])})"
+    )
+    return report
 
 
 def main() -> int:
@@ -82,6 +106,13 @@ def main() -> int:
         assert len(package.content) == done["verified_size"]
         print(f"package downloaded: {len(package.content)} bytes, sha256 verified")
 
+        # Quality-control the collected package.
+        report_v1 = run_qc(client, api, task_id)
+        assert report_v1["result"] == "pass", report_v1
+        assert report_v1["package_sha256"] == done["verified_sha256"]
+        task_view = client.get(f"{api}/tasks/{task_id}").json()
+        assert task_view["qc"]["report_id"] == report_v1["id"]
+
         # Switch the source revision and refresh: old package must be replaced.
         client.post(
             f"{source}/admin/revision",
@@ -96,6 +127,23 @@ def main() -> int:
         package2.raise_for_status()
         assert hashlib.sha256(package2.content).hexdigest() == done2["verified_sha256"]
         print("revision switch verified:", done2["source_revision"], done2["verified_sha256"][:12])
+
+        # The v1 report stays queryable but no longer applies to the package.
+        old = client.get(f"{api}/qc/{report_v1['id']}").json()
+        assert old["package_sha256"] == done["verified_sha256"]
+        assert old["applies_to_current_package"] is False
+        assert client.get(f"{api}/tasks/{task_id}").json()["qc"] is None
+
+        # QC the new package; the task view now points at the fresh report.
+        report_v2 = run_qc(client, api, task_id)
+        assert report_v2["result"] == "pass", report_v2
+        assert report_v2["package_sha256"] == done2["verified_sha256"]
+        task_view = client.get(f"{api}/tasks/{task_id}").json()
+        assert task_view["qc"]["report_id"] == report_v2["id"]
+        listing = client.get(f"{api}/tasks/{task_id}/qc").json()
+        assert {row["id"] for row in listing} == {report_v1["id"], report_v2["id"]}
+        print("old report kept; new report applies to the current package")
+
         print("events:", [e["event"] for e in client.get(f"{api}/tasks/{task_id}/events").json()])
     return 0
 

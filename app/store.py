@@ -42,6 +42,31 @@ CREATE TABLE IF NOT EXISTS task_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, seq);
+
+CREATE TABLE IF NOT EXISTS qc_reports (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    station TEXT NOT NULL,
+    date TEXT NOT NULL,
+    state TEXT NOT NULL,
+    package_sha256 TEXT NOT NULL,
+    package_size INTEGER NOT NULL,
+    snapshot_path TEXT NOT NULL,
+    result TEXT,
+    report_json TEXT,
+    error TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_qc_reports_task ON qc_reports(task_id, created_at);
+
+-- At most one active (queued/running) QC job per task and package digest.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_qc_reports_active
+    ON qc_reports(task_id, package_sha256) WHERE state IN ('queued', 'running');
 """
 
 
@@ -193,6 +218,111 @@ class Store:
             .execute("SELECT * FROM task_events WHERE task_id=? ORDER BY seq", (task_id,))
             .fetchall()
         )
+
+    # -- qc reports ------------------------------------------------------
+    def insert_qc_report(
+        self,
+        *,
+        report_id: str,
+        task_id: str,
+        station: str,
+        date: str,
+        package_sha256: str,
+        package_size: int,
+        snapshot_path: str,
+    ) -> None:
+        now = utcnow()
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT INTO qc_reports "
+                "(id, task_id, station, date, state, package_sha256, package_size, "
+                " snapshot_path, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)",
+                (
+                    report_id,
+                    task_id,
+                    station,
+                    date,
+                    package_sha256,
+                    package_size,
+                    snapshot_path,
+                    now,
+                    now,
+                ),
+            )
+
+    def get_qc_report(self, report_id: str) -> sqlite3.Row | None:
+        return (
+            self.connection()
+            .execute("SELECT * FROM qc_reports WHERE id=?", (report_id,))
+            .fetchone()
+        )
+
+    def list_qc_reports(self, task_id: str) -> list[sqlite3.Row]:
+        return (
+            self.connection()
+            .execute(
+                "SELECT * FROM qc_reports WHERE task_id=? "
+                "ORDER BY created_at DESC, rowid DESC",
+                (task_id,),
+            )
+            .fetchall()
+        )
+
+    def active_qc_report(self, task_id: str, package_sha256: str) -> sqlite3.Row | None:
+        """The queued/running report for exactly this package digest, if any."""
+        return (
+            self.connection()
+            .execute(
+                "SELECT * FROM qc_reports "
+                "WHERE task_id=? AND package_sha256=? AND state IN ('queued', 'running') "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (task_id, package_sha256),
+            )
+            .fetchone()
+        )
+
+    def latest_qc_report_for_sha(self, task_id: str, package_sha256: str) -> sqlite3.Row | None:
+        """Newest report (any state) accepted for exactly this package digest."""
+        return (
+            self.connection()
+            .execute(
+                "SELECT * FROM qc_reports WHERE task_id=? AND package_sha256=? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (task_id, package_sha256),
+            )
+            .fetchone()
+        )
+
+    def qc_reports_in_state(self, state: str) -> list[sqlite3.Row]:
+        return (
+            self.connection()
+            .execute(
+                "SELECT * FROM qc_reports WHERE state=? ORDER BY created_at, rowid",
+                (state,),
+            )
+            .fetchall()
+        )
+
+    def qc_cas(
+        self,
+        report_id: str,
+        expected_state: str | tuple[str, ...],
+        new_state: str,
+        **fields: Any,
+    ) -> bool:
+        """Conditional QC report transition, mirroring :meth:`cas_state`."""
+        expected = (
+            (expected_state,) if isinstance(expected_state, str) else tuple(expected_state)
+        )
+        fields = {**fields, "state": new_state, "updated_at": utcnow()}
+        assignments = ", ".join(f"{name}=?" for name in fields)
+        placeholders = ", ".join("?" for _ in expected)
+        sql = f"UPDATE qc_reports SET {assignments} WHERE id=? AND state IN ({placeholders})"
+        values = list(fields.values()) + [report_id, *expected]
+        with self.transaction() as conn:
+            cur = conn.execute(sql, values)
+            return cur.rowcount == 1
 
     @staticmethod
     def _event(conn: sqlite3.Connection, task_id: str, event: str, detail: str | None, at: str) -> None:
